@@ -3,7 +3,9 @@
 package paxos
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 )
 
 const basePort = 5001
+const streamCount = 1000
 
 type cluster struct {
 	transports      map[string]Transport
@@ -23,13 +26,13 @@ type cluster struct {
 	numNodeError    int
 }
 
-func (c *cluster) NodeError(nodeUrl string) {
-	c.numNodeError++
-	log.Infof("Received node error for %s", nodeUrl)
+func (cl *cluster) NodeError(nodelURL string) {
+	cl.numNodeError++
+	log.Infof("Received node error for %s", nodelURL)
 }
 
-func (c *cluster) Prepare(req *paxospb.PrepareReq) (*paxospb.PrepareResp, error) {
-	c.numPrepareReq++
+func (cl *cluster) Prepare(req *paxospb.PrepareReq) (*paxospb.PrepareResp, error) {
+	cl.numPrepareReq++
 	log.Debugf("Received Prepare rpc call from: %s", req.RequesterId)
 	resp := paxospb.PrepareResp{
 		VotedFor:    "test",
@@ -38,20 +41,36 @@ func (c *cluster) Prepare(req *paxospb.PrepareReq) (*paxospb.PrepareResp, error)
 	}
 	return &resp, nil
 }
-func (c *cluster) Extend(req *paxospb.ExtendReq) (*paxospb.ExtendResp, error) {
-	c.numExtendReq++
-	return &paxospb.ExtendResp{}, nil
+func (cl *cluster) Extend(req *paxospb.ExtendReq) (*paxospb.ExtendResp, error) {
+	cl.numExtendReq++
+	return nil, errors.New("Testing RPC error")
 }
-func (c *cluster) AcceptLog(req *paxospb.AcceptLogReq) (*paxospb.AcceptLogResp, error) {
-	c.numAcceptLogReq++
+func (cl *cluster) AcceptLog(req *paxospb.AcceptLogReq) (*paxospb.AcceptLogResp, error) {
+	cl.numAcceptLogReq++
 	return &paxospb.AcceptLogResp{}, nil
 }
 
-func (c *cluster) AddMember(req *paxospb.MemberUpdate) (*paxospb.MemberUpdateResp, error) {
+func (cl *cluster) RequestSync(req *paxospb.SyncReq, stream paxospb.Paxos_RequestSyncServer) error {
+	for i := 0; i < streamCount; i++ {
+		entry := paxospb.SyncEntry{
+			EntryType: paxospb.EntryType_LogType,
+			LogEntry: &paxospb.LogEntry{
+				Term:   uint64(i),
+				LogIdx: uint64(i),
+			},
+		}
+		if err := stream.Send(&entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (cl *cluster) AddMember(req *paxospb.MemberUpdate) (*paxospb.MemberUpdateResp, error) {
 	return &paxospb.MemberUpdateResp{}, nil
 }
 
-func (c *cluster) DelMember(req *paxospb.MemberUpdate) (*paxospb.MemberUpdateResp, error) {
+func (cl *cluster) DelMember(req *paxospb.MemberUpdate) (*paxospb.MemberUpdateResp, error) {
 	return &paxospb.MemberUpdateResp{}, nil
 }
 
@@ -63,28 +82,28 @@ func createFakeCluster(numNodes int) (*cluster, error) {
 
 	// Create all transports
 	for i := 0; i < numNodes; i++ {
-		nodeUrl := fmt.Sprintf("localhost:%d", (basePort + i))
+		nodelURL := fmt.Sprintf("localhost:%d", (basePort + i))
 
 		// create the transport
-		trans, err := NewGrpcTransport(&c, nodeUrl)
+		trans, err := NewGrpcTransport(&c, nodelURL)
 		if err != nil {
-			log.Errorf("Failed to create transport %s. Err: %v", nodeUrl, err)
+			log.Errorf("Failed to create transport %s. Err: %v", nodelURL, err)
 			return nil, err
 		}
 
-		c.transports[nodeUrl] = trans
+		c.transports[nodelURL] = trans
 	}
 
 	// Add each other nodes as peers
 	for i := 0; i < numNodes; i++ {
-		nodeUrl := fmt.Sprintf("localhost:%d", (basePort + i))
+		nodelURL := fmt.Sprintf("localhost:%d", (basePort + i))
 
 		for j := 0; j < numNodes; j++ {
-			peerUrl := fmt.Sprintf("localhost:%d", (basePort + j))
+			peerURL := fmt.Sprintf("localhost:%d", (basePort + j))
 			if j != i {
-				err := c.transports[nodeUrl].AddPeer(peerUrl)
+				err := c.transports[nodelURL].AddPeer(peerURL)
 				if err != nil {
-					log.Errorf("Error adding peer %s to %s. Err: %v", peerUrl, nodeUrl, err)
+					log.Errorf("Error adding peer %s to %s. Err: %v", peerURL, nodelURL, err)
 					return nil, err
 				}
 			}
@@ -94,20 +113,20 @@ func createFakeCluster(numNodes int) (*cluster, error) {
 	return &c, nil
 }
 
-// makeFullMeshRpcCalls make full mesh RPC calls within the cluster
-func (cl *cluster) makeFullMeshRpcCalls() error {
+// makeFullMeshRPCCalls make full mesh RPC calls within the cluster
+func (cl *cluster) makeFullMeshRPCCalls() error {
 	// Make full mesh rpc calls
-	for nodeUrl, trans := range cl.transports {
-		for peerUrl, _ := range cl.transports {
-			if nodeUrl != peerUrl {
-				_, err := trans.SendPrepare(peerUrl, &paxospb.PrepareReq{
-					RequesterId: nodeUrl,
+	for nodelURL, trans := range cl.transports {
+		for peerURL := range cl.transports {
+			if nodelURL != peerURL {
+				_, err := trans.SendPrepare(peerURL, &paxospb.PrepareReq{
+					RequesterId: nodelURL,
 					Term:        1,
 					LastLogIdx:  1,
 					LeaseTime:   100,
 				})
 				if err != nil {
-					log.Errorf("SendPrepare Rpc call err from %s to %s. Err: %v", nodeUrl, peerUrl, err)
+					log.Errorf("SendPrepare Rpc call err from %s to %s. Err: %v", nodelURL, peerURL, err)
 					return err
 				}
 			}
@@ -143,7 +162,7 @@ func (s *TransportSuite) TestTransportRpcs(c *C) {
 	}()
 
 	// Make full mesh rpc calls
-	c.Assert(cl.makeFullMeshRpcCalls(), IsNil)
+	c.Assert(cl.makeFullMeshRPCCalls(), IsNil)
 
 	// verify rpc counts are correct
 	c.Check(cl.numPrepareReq, Equals, (numNodes * (numNodes - 1)))
@@ -163,7 +182,7 @@ func (s *TransportSuite) TestTransportDisconnectConnect(c *C) {
 	}()
 
 	// Make full mesh rpc calls
-	c.Assert(cl.makeFullMeshRpcCalls(), IsNil)
+	c.Assert(cl.makeFullMeshRPCCalls(), IsNil)
 
 	// verify rpc counts are correct
 	c.Check(cl.numPrepareReq, Equals, (numNodes * (numNodes - 1)))
@@ -183,7 +202,7 @@ func (s *TransportSuite) TestTransportDisconnectConnect(c *C) {
 		}
 
 		// Make full mesh rpc calls
-		c.Assert(cl.makeFullMeshRpcCalls(), IsNil)
+		c.Assert(cl.makeFullMeshRPCCalls(), IsNil)
 
 		// verify rpc counts are correct
 		c.Check(cl.numPrepareReq, Equals, (numNodes * (numNodes - 1)))
@@ -201,24 +220,24 @@ func (s *TransportSuite) TestTransportDown(c *C) {
 	}()
 
 	// Make full mesh rpc calls
-	c.Assert(cl.makeFullMeshRpcCalls(), IsNil)
+	c.Assert(cl.makeFullMeshRPCCalls(), IsNil)
 
 	// verify rpc counts are correct
 	c.Check(cl.numPrepareReq, Equals, (numNodes * (numNodes - 1)))
 
 	cl.numPrepareReq = 0
 
-	for nodeUrl, trans := range cl.transports {
+	for nodelURL, trans := range cl.transports {
 		// stop the server
 		trans.Stop()
 
 		time.Sleep(time.Millisecond * 10)
 
 		// Try to make RPC calls from all peers to this node and verify it fails
-		for peerUrl, peer := range cl.transports {
-			if nodeUrl != peerUrl {
-				_, err := peer.SendPrepare(nodeUrl, &paxospb.PrepareReq{
-					RequesterId: peerUrl,
+		for peerURL, peer := range cl.transports {
+			if nodelURL != peerURL {
+				_, err := peer.SendPrepare(nodelURL, &paxospb.PrepareReq{
+					RequesterId: peerURL,
 					Term:        1,
 					LastLogIdx:  1,
 					LeaseTime:   100,
@@ -233,9 +252,9 @@ func (s *TransportSuite) TestTransportDown(c *C) {
 		trans.Start()
 
 		// add the peer back
-		for peerUrl, node := range cl.transports {
-			if peerUrl != nodeUrl {
-				node.AddPeer(nodeUrl)
+		for peerURL, node := range cl.transports {
+			if peerURL != nodelURL {
+				node.AddPeer(nodelURL)
 			}
 		}
 	}
@@ -244,10 +263,78 @@ func (s *TransportSuite) TestTransportDown(c *C) {
 	c.Check(cl.numNodeError, Equals, (numNodes * (numNodes - 1)))
 
 	// Make full mesh rpc calls
-	c.Assert(cl.makeFullMeshRpcCalls(), IsNil)
+	c.Assert(cl.makeFullMeshRPCCalls(), IsNil)
 
 	// verify rpc counts are correct
 	c.Check(cl.numPrepareReq, Equals, (numNodes * (numNodes - 1)))
+}
+
+func (s *TransportSuite) TestTransportRpcError(c *C) {
+	numNodes := 5
+
+	cl, err := createFakeCluster(numNodes)
+	c.Assert(err, IsNil)
+	defer func() {
+		cl.destroy()
+		time.Sleep(time.Millisecond * 10)
+	}()
+
+	// Make full mesh rpc calls
+	c.Assert(cl.makeFullMeshRPCCalls(), IsNil)
+
+	// verify rpc counts are correct
+	c.Check(cl.numPrepareReq, Equals, (numNodes * (numNodes - 1)))
+
+	// Make full mesh rpc calls
+	for nodelURL, trans := range cl.transports {
+		for peerURL := range cl.transports {
+			if nodelURL != peerURL {
+				_, err := trans.SendExtend(peerURL, &paxospb.ExtendReq{
+					RequesterId: nodelURL,
+					Term:        1,
+					LeaseTime:   100,
+				})
+				c.Assert(err, NotNil)
+			}
+		}
+	}
+}
+
+func (s *TransportSuite) TestTransportRpcStream(c *C) {
+	numNodes := 5
+
+	cl, err := createFakeCluster(numNodes)
+	c.Assert(err, IsNil)
+	defer func() {
+		cl.destroy()
+		time.Sleep(time.Millisecond * 10)
+	}()
+
+	// Make full mesh stream rpc calls
+	for nodelURL, trans := range cl.transports {
+		for peerURL := range cl.transports {
+			if nodelURL != peerURL {
+				stream, err := trans.SendRequestSync(peerURL, &paxospb.SyncReq{
+					MemberId: nodelURL,
+				})
+				c.Assert(err, IsNil)
+				rxStreamCount := 0
+				for {
+					entry, err := stream.Recv()
+					if err == io.EOF {
+						break
+					}
+					c.Assert(err, IsNil)
+					c.Check(entry.EntryType, Equals, paxospb.EntryType_LogType)
+					c.Check(entry.LogEntry.Term, Equals, uint64(rxStreamCount))
+					c.Check(entry.LogEntry.LogIdx, Equals, uint64(rxStreamCount))
+					rxStreamCount++
+				}
+				c.Check(rxStreamCount, Equals, streamCount)
+				log.Infof("Streaming RPC Received %d entries, expected %d", rxStreamCount, streamCount)
+			}
+		}
+	}
 }
 
 func (s *TransportSuite) BenchmarkTransportRpcCall(c *C) {
@@ -260,20 +347,20 @@ func (s *TransportSuite) BenchmarkTransportRpcCall(c *C) {
 		time.Sleep(time.Millisecond * 10)
 	}()
 
-	serverUrl := fmt.Sprintf("localhost:%d", (basePort + 1))
-	clientUrl := fmt.Sprintf("localhost:%d", (basePort + 0))
-	client := cl.transports[clientUrl]
+	serverURL := fmt.Sprintf("localhost:%d", (basePort + 1))
+	clientURL := fmt.Sprintf("localhost:%d", (basePort + 0))
+	client := cl.transports[clientURL]
 
 	// run benchmark
 	for n := 0; n < c.N; n++ {
-		_, err := client.SendPrepare(serverUrl, &paxospb.PrepareReq{
+		_, err := client.SendPrepare(serverURL, &paxospb.PrepareReq{
 			RequesterId: "test",
 			Term:        1,
 			LastLogIdx:  1,
 			LeaseTime:   100,
 		})
 		if err != nil {
-			c.Fatalf("Failed to make RPC call from %s to %s. Err: %v", serverUrl, clientUrl, err)
+			c.Fatalf("Failed to make RPC call from %s to %s. Err: %v", serverURL, clientURL, err)
 		}
 	}
 }

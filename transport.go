@@ -17,31 +17,38 @@ import (
 	gpt "google.golang.org/grpc/transport"
 )
 
+// Transport interface implemented by all transports
 type Transport interface {
 	Start()
 	Stop()
-	AddPeer(peerUrl string) error
-	RemovePeer(peerUrl string) error
-	SendPrepare(peerUrl string, req *paxospb.PrepareReq) (*paxospb.PrepareResp, error)
-	SendExtend(peerUrl string, req *paxospb.ExtendReq) (*paxospb.ExtendResp, error)
-	SendAcceptLog(peerUrl string, req *paxospb.AcceptLogReq) (*paxospb.AcceptLogResp, error)
+	AddPeer(peerURL string) error
+	RemovePeer(peerURL string) error
+	SendPrepare(peerURL string, req *paxospb.PrepareReq) (*paxospb.PrepareResp, error)
+	SendExtend(peerURL string, req *paxospb.ExtendReq) (*paxospb.ExtendResp, error)
+	SendAcceptLog(peerURL string, req *paxospb.AcceptLogReq) (*paxospb.AcceptLogResp, error)
+	SendRequestSync(peerURL string, req *paxospb.SyncReq) (paxospb.Paxos_RequestSyncClient, error)
 }
 
+// TransportCallback interface needs to be implemented by paxos
+// Transports call these functions when thry receive an incoming RPC message
 type TransportCallback interface {
-	NodeError(nodeUrl string)
+	NodeError(nodeURL string)
 	Prepare(req *paxospb.PrepareReq) (*paxospb.PrepareResp, error)
 	Extend(req *paxospb.ExtendReq) (*paxospb.ExtendResp, error)
 	AcceptLog(req *paxospb.AcceptLogReq) (*paxospb.AcceptLogResp, error)
 	AddMember(req *paxospb.MemberUpdate) (*paxospb.MemberUpdateResp, error)
 	DelMember(req *paxospb.MemberUpdate) (*paxospb.MemberUpdateResp, error)
+	RequestSync(req *paxospb.SyncReq, stream paxospb.Paxos_RequestSyncServer) error
 }
 
+// GrpcTransport implements gRpc based transport
+// This is based on google's gRpc. see www.grpc.io for more details
 type GrpcTransport struct {
 	// RPC server
 	grpcServer *grpc.Server
 
 	// Url where server is listening
-	listenUrl string
+	listenURL string
 
 	// Message handler
 	handler TransportCallback
@@ -52,12 +59,12 @@ type GrpcTransport struct {
 
 // NewGrpcTransport creates a new transport
 // FIXME: add TLS and configurable timeout
-func NewGrpcTransport(handler TransportCallback, listenUrl string) (Transport, error) {
+func NewGrpcTransport(handler TransportCallback, listenURL string) (Transport, error) {
 	// init a grpc transport object
 	trans := GrpcTransport{}
 	trans.clients = make(map[string]paxospb.PaxosClient)
 	trans.handler = handler
-	trans.listenUrl = listenUrl
+	trans.listenURL = listenURL
 
 	// start the grpc server
 	trans.Start()
@@ -71,9 +78,9 @@ func NewGrpcTransport(handler TransportCallback, listenUrl string) (Transport, e
 // Start starts the grpc server
 func (trans *GrpcTransport) Start() {
 	// Start a listener
-	lis, err := net.Listen("tcp", trans.listenUrl)
+	lis, err := net.Listen("tcp", trans.listenURL)
 	if err != nil {
-		log.Fatalf("failed to listen to %s: Err %v", trans.listenUrl, err)
+		log.Fatalf("failed to listen to %s: Err %v", trans.listenURL, err)
 	}
 
 	// start new grpc server
@@ -82,74 +89,74 @@ func (trans *GrpcTransport) Start() {
 	paxospb.RegisterPaxosServer(server, trans)
 	go server.Serve(lis)
 
-	log.Infof("gRpc serverListening on %s", trans.listenUrl)
+	log.Infof("gRpc serverListening on %s", trans.listenURL)
 }
 
 // Stop stops grpc server
 func (trans *GrpcTransport) Stop() {
 	trans.grpcServer.Stop()
 	trans.grpcServer = nil
-	log.Infof("Stopped gRpc server %s", trans.listenUrl)
+	log.Infof("Stopped gRpc server %s", trans.listenURL)
 }
 
 // AddPeer connects to a peer
-func (trans *GrpcTransport) AddPeer(peerUrl string) error {
+func (trans *GrpcTransport) AddPeer(peerURL string) error {
 	// Set up a connection to the server.
-	conn, err := grpc.Dial(peerUrl, grpc.WithInsecure(), grpc.WithTimeout(time.Second*3))
+	conn, err := grpc.Dial(peerURL, grpc.WithInsecure(), grpc.WithTimeout(time.Second*3))
 	if err != nil {
-		log.Errorf("could not connect to %s. Err: %v", peerUrl, err)
+		log.Errorf("could not connect to %s. Err: %v", peerURL, err)
 		return err
 	}
 
-	log.Infof("Node %s Connected to %s", trans.listenUrl, peerUrl)
+	log.Infof("Node %s Connected to %s", trans.listenURL, peerURL)
 
 	// create a client
 	c := paxospb.NewPaxosClient(conn)
-	trans.clients[peerUrl] = c
+	trans.clients[peerURL] = c
 
 	return nil
 }
 
 // RemovePeer disconnects from a peer
-func (trans *GrpcTransport) RemovePeer(peerUrl string) error {
-	_, ok := trans.clients[peerUrl]
+func (trans *GrpcTransport) RemovePeer(peerURL string) error {
+	_, ok := trans.clients[peerURL]
 	if !ok {
-		log.Errorf("Could not find peer %s", peerUrl)
+		log.Errorf("Could not find peer %s", peerURL)
 		return errors.New("Peer not found")
 	}
 
-	delete(trans.clients, peerUrl)
+	delete(trans.clients, peerURL)
 
 	return nil
 }
 
-// handleRpcError Handle an RPC error
-func (trans *GrpcTransport) handleRpcError(peerUrl string, err error) {
+// handleRPCError Handle an RPC error
+func (trans *GrpcTransport) handleRPCError(peerURL string, err error) {
 	if (err == gpt.ErrConnClosing) || (grpc.ErrorDesc(err) == grpc.ErrClientConnClosing.Error()) {
-		log.Infof("Node %s disconnected. Err: %v", peerUrl, err)
+		log.Infof("Node %s disconnected. Err: %v", peerURL, err)
 
 		// remove the Peer
-		trans.RemovePeer(peerUrl)
+		trans.RemovePeer(peerURL)
 
 		// make callbacks
-		trans.handler.NodeError(peerUrl)
+		trans.handler.NodeError(peerURL)
 	}
 }
 
 // SendPrepare sends prepare message to a peer
-func (trans *GrpcTransport) SendPrepare(peerUrl string, req *paxospb.PrepareReq) (*paxospb.PrepareResp, error) {
+func (trans *GrpcTransport) SendPrepare(peerURL string, req *paxospb.PrepareReq) (*paxospb.PrepareResp, error) {
 	// find the client
-	client, ok := trans.clients[peerUrl]
+	client, ok := trans.clients[peerURL]
 	if !ok {
-		log.Errorf("Could not find the clinet %s", peerUrl)
+		log.Errorf("Could not find the clinet %s", peerURL)
 		return nil, errors.New("Client not found")
 	}
 
 	// RPC call
 	resp, err := client.Prepare(context.Background(), req)
 	if err != nil {
-		log.Errorf("Error during Prepare rpc call to %s: %v", peerUrl, err)
-		trans.handleRpcError(peerUrl, err)
+		log.Errorf("Error during Prepare rpc call to %s: %v", peerURL, err)
+		trans.handleRPCError(peerURL, err)
 		return resp, err
 	}
 
@@ -157,19 +164,19 @@ func (trans *GrpcTransport) SendPrepare(peerUrl string, req *paxospb.PrepareReq)
 }
 
 // SendExtend sends extend message to a peer
-func (trans *GrpcTransport) SendExtend(peerUrl string, req *paxospb.ExtendReq) (*paxospb.ExtendResp, error) {
+func (trans *GrpcTransport) SendExtend(peerURL string, req *paxospb.ExtendReq) (*paxospb.ExtendResp, error) {
 	// find the client
-	client, ok := trans.clients[peerUrl]
+	client, ok := trans.clients[peerURL]
 	if !ok {
-		log.Errorf("Could not find the clinet %s", peerUrl)
+		log.Errorf("Could not find the clinet %s", peerURL)
 		return nil, errors.New("Client not found")
 	}
 
 	// RPC call
 	resp, err := client.Extend(context.Background(), req)
 	if err != nil {
-		log.Errorf("Error during Extend rpc call to %s: %v", peerUrl, err)
-		trans.handleRpcError(peerUrl, err)
+		log.Errorf("Error during Extend rpc call to %s: %v", peerURL, err)
+		trans.handleRPCError(peerURL, err)
 		return resp, err
 	}
 
@@ -177,23 +184,43 @@ func (trans *GrpcTransport) SendExtend(peerUrl string, req *paxospb.ExtendReq) (
 }
 
 // SendAcceptLog sends accept message to a peer
-func (trans *GrpcTransport) SendAcceptLog(peerUrl string, req *paxospb.AcceptLogReq) (*paxospb.AcceptLogResp, error) {
+func (trans *GrpcTransport) SendAcceptLog(peerURL string, req *paxospb.AcceptLogReq) (*paxospb.AcceptLogResp, error) {
 	// find the client
-	client, ok := trans.clients[peerUrl]
+	client, ok := trans.clients[peerURL]
 	if !ok {
-		log.Errorf("Could not find the clinet %s", peerUrl)
+		log.Errorf("Could not find the clinet %s", peerURL)
 		return nil, errors.New("Client not found")
 	}
 
 	// RPC call
 	resp, err := client.AcceptLog(context.Background(), req)
 	if err != nil {
-		log.Errorf("Error during AcceptLog rpc call to %s: %v", peerUrl, err)
-		trans.handleRpcError(peerUrl, err)
+		log.Errorf("Error during AcceptLog rpc call to %s: %v", peerURL, err)
+		trans.handleRPCError(peerURL, err)
 		return resp, err
 	}
 
 	return resp, nil
+}
+
+// SendRequestSync sends request sync message
+func (trans *GrpcTransport) SendRequestSync(peerURL string, req *paxospb.SyncReq) (paxospb.Paxos_RequestSyncClient, error) {
+	// find the client
+	client, ok := trans.clients[peerURL]
+	if !ok {
+		log.Errorf("Could not find the clinet %s", peerURL)
+		return nil, errors.New("Client not found")
+	}
+
+	// RPC call
+	stream, err := client.RequestSync(context.Background(), req)
+	if err != nil {
+		log.Errorf("Error during AcceptLog rpc call to %s: %v", peerURL, err)
+		trans.handleRPCError(peerURL, err)
+		return stream, err
+	}
+
+	return stream, nil
 }
 
 // Prepare handles prepare message
@@ -211,16 +238,19 @@ func (trans *GrpcTransport) AcceptLog(ctx context.Context, req *paxospb.AcceptLo
 	return trans.handler.AcceptLog(req)
 }
 
+// AddMember handles add member request
 func (trans *GrpcTransport) AddMember(ctx context.Context, req *paxospb.MemberUpdate) (*paxospb.MemberUpdateResp, error) {
 	return trans.handler.AddMember(req)
 }
 
+// DelMember handles delete member request
 func (trans *GrpcTransport) DelMember(ctx context.Context, req *paxospb.MemberUpdate) (*paxospb.MemberUpdateResp, error) {
 	return trans.handler.DelMember(req)
 }
 
+// RequestSync handles request sync message
 func (trans *GrpcTransport) RequestSync(req *paxospb.SyncReq, stream paxospb.Paxos_RequestSyncServer) error {
-	return nil
+	return trans.handler.RequestSync(req, stream)
 }
 
 // Dummy logger to prevent unnecesary grpc logs
